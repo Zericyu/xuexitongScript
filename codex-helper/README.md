@@ -17,6 +17,10 @@ Windows 优先识别 Codex 桌面应用附带的 `codex.exe`，也支持 PATH �
 
 不需要把 API Key 填到油猴脚本中。Codex CLI 自行复用其已保存的登录状态，调用使用当前账户的可用额度。实现依据：[OpenAI 官方非交互模式文档](https://learn.chatgpt.com/docs/non-interactive-mode)。
 
+## 视频弹题纠错
+
+平台明确显示“回答错误”且原生提交按钮可用时，将失败选项作为反馈附在题目图片中重新判断，修改选项并再次提交；不复用被拒绝的答案，每题最多三次不同答案提交。记录失败选项供刷新后恢复判断。结果不明、平台要求回看、答案不确定或重复失败答案时停止，不自动枚举答案。仍只读取可见题目和正常选中状态，不读取隐藏评分值。
+
 ## 已完成视频识别修复
 
 重新进入章节时，优先识别当前视频所在附件的原生 `ans-job-finished` 完成标记，停止重复播放并通过既有衔接流程进入未完成文档或测验。没有完成标记的内容仍按正常流程处理；读取不到框架时不推断完成。不修改平台任务记录。
@@ -67,7 +71,7 @@ Windows 双击 `stop.cmd`，其他系统运行 `node codex-helper/stop.mjs`，�
 在仓库根目录运行：
 
 ```sh
-node --test codex-helper/tests/*.test.mjs codex-helper/tests/*.test.cjs codex-helper/tests/*.test.cjs
+node --test codex-helper/tests/*.test.mjs codex-helper/tests/*.test.cjs codex-helper/tests/*.test.cjs codex-helper/tests/*.test.cjs
 node tests/verify-v3.mjs
 ```
 

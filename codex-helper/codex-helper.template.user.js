@@ -846,17 +846,32 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
     if(disposed||failed)return;failed=true;pause(getVideo());setStatus(message);onError(message);
   }
   const keyFor=signature=>typeof storageKey==='function'?storageKey(signature):String(storageKey||'codexVideoPopup:')+signature;
-  function readJournal(key){const value=sessionStorage.getItem(key);if(!value)return null;try{return JSON.parse(value).state;}catch{return value;}}
-  function writeJournal(key,state){sessionStorage.setItem(key,JSON.stringify({state,at:Date.now()}));}
+  function readJournal(key){const value=sessionStorage.getItem(key);if(!value)return null;try{const result=JSON.parse(value);return typeof result==='object'?result:{state:String(result)};}catch{return {state:value};}}
+  function writeJournal(key,state,details={}){sessionStorage.setItem(key,JSON.stringify({state,at:Date.now(),...details}));}
+  const selected=snapshot=>snapshot.q.options.filter(o=>o.element.checked).map(o=>o.letter).sort();
+  const wrongVisible=snapshot=>visible(snapshot.card.querySelector('#spanNot'));
+  const reviewRequired=snapshot=>['#spanNotBack','#spanNotBackPoint'].some(s=>visible(snapshot.card.querySelector(s)));
+  const canCorrect=snapshot=>wrongVisible(snapshot)&&!reviewRequired(snapshot)&&visible(snapshot.card.querySelector('#videoquiz-submit'))&&!visible(snapshot.card.querySelector('#videoquiz-submitting'));
+  const answerKey=letters=>[...letters].sort().join('|');
   function begin(snapshot){
     const key=keyFor(snapshot.signature);
-    if(readJournal(key)){fail('该视频弹题已有提交记录，请检查平台结果；本次不重复提交');return;}
-    const attempt={snapshot,key,phase:'answering',since:Date.now(),continued:false};active=attempt;requestPending=true;
-    setStatus('正在调用 Codex 回答视频内弹题');
-    Promise.resolve().then(()=>requestAnswers([snapshot.q])).then(answers=>{
+    const journal=readJournal(key);
+    let rejected=Array.isArray(journal?.rejected)?journal.rejected:[];
+    if(reviewRequired(snapshot)){fail('平台要求回看视频，暂不重新提交');return;}
+    if(canCorrect(snapshot)){
+      const previous=journal?.submitted||selected(snapshot);
+      if(!previous.length){fail('平台提示回答错误，但无法确认上次选项；未重复提交');return;}
+      if(!rejected.some(a=>answerKey(a)===answerKey(previous)))rejected=[...rejected,previous];
+      if(rejected.length>=3){fail('视频弹题已达到三次提交上限，请检查题目');return;}
+      writeJournal(key,'rejected',{rejected});
+    }else if(journal){fail('该视频弹题已有提交记录，请检查平台结果；本次不重复提交');return;}
+    const attempt={snapshot,key,rejected,phase:'answering',since:Date.now(),continued:false};active=attempt;requestPending=true;
+    setStatus(rejected.length?'平台反馈回答错误，正在重新判断并修改答案':'正在调用 Codex 回答视频内弹题');
+    Promise.resolve().then(()=>requestAnswers([{...snapshot.q,retryRejected:attempt.rejected}])).then(answers=>{
       if(disposed||active!==attempt||!same(snapshot)){if(active===attempt)active=null;return;}
       const desired=answers?.get?.(1);
       if(!Array.isArray(desired)||!desired.length||new Set(desired).size!==desired.length||desired.some(letter=>!snapshot.q.options.some(option=>option.letter===letter))||snapshot.q.kind!=='多选题'&&desired.length!==1)throw new Error('视频弹题答案验证失败，本次未提交');
+      if(attempt.rejected.some(previous=>answerKey(previous)===answerKey(desired)))throw new Error('重新判断仍返回已被平台拒绝的答案，未重复提交');
       for(const option of snapshot.q.options){
         if(Boolean(option.element.checked)===desired.includes(option.letter))continue;
         if(snapshot.q.kind!=='多选题'&&!desired.includes(option.letter))continue;
@@ -868,7 +883,7 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
       if(actual.join('|')!==[...desired].sort().join('|'))throw new Error('视频弹题未能确认准确选中，本次未提交');
       const submit=snapshot.card.querySelector('#videoquiz-submit');
       if(!visible(submit))throw new Error('未找到可见的视频弹题提交按钮，本次未提交');
-      writeJournal(key,'submitting');attempt.phase='submitting';attempt.since=Date.now();attempt.baseline=Number(snapshot.video.currentTime)||0;
+      attempt.submitted=[...desired].sort();writeJournal(key,'submitting',{submitted:attempt.submitted,rejected:attempt.rejected});attempt.phase='submitting';attempt.since=Date.now();attempt.baseline=Number(snapshot.video.currentTime)||0;
       setStatus('视频内弹题已选中，等待平台确认提交');submit.click();
     }).catch(error=>{if(!disposed&&active===attempt){if(!same(snapshot)&&attempt.phase==='answering'){active=null;return;}fail('视频内弹题需要处理：'+error.message);}}).finally(()=>{requestPending=false;});
   }
@@ -877,8 +892,13 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
     if(video!==snapshot.video||videoSource(video)!==snapshot.source){fail('视频弹题提交结果尚未确认，播放器已变化，请检查平台结果');return;}
     const samePopup=same(snapshot);
     if(samePopup){
-      const error=['#spanNot','#spanNotBack','#spanNotBackPoint'].map(selector=>snapshot.card.querySelector(selector)).find(visible);
-      if(error){fail('平台提示视频弹题答错或需要回看，请检查；本次不重复提交');return;}
+      if(reviewRequired(snapshot)){fail('平台要求回看视频，暂不重新提交');return;}
+      if(wrongVisible(snapshot)){
+        if(Date.now()-attempt.since<2000)return;
+        if(canCorrect(snapshot)){active=null;begin(snapshot);return;}
+        if(Date.now()-attempt.since>=60000)fail('答错后平台尚未允许重新提交，请检查');
+        return;
+      }
       const continuation=snapshot.card.querySelector('#videoquiz-continue');
       if(!attempt.continued&&visible(continuation)&&!visible(snapshot.card.querySelector('#videoquiz-submitting'))){attempt.continued=true;continuation.click();}
     }
@@ -959,7 +979,7 @@ async function renderQuizImages(questions) {
                 lineHasText = true;
             }
         }
-        canvas.height = Math.ceil(y + 60);
+        canvas.height = Math.ceil(y + (q.retryRejected?.length ? 170 : 60));
         if (canvas.height > 6000) throw new Error('题目图片过长，需要人工检查');
         const ctx = canvas.getContext('2d');
         ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -969,6 +989,7 @@ async function renderQuizImages(questions) {
             ctx.font = command.font;
             ctx.fillText(command.char, command.x, command.y);
         }
+        if(q.retryRejected?.length){ctx.font='22px sans-serif';ctx.fillStyle='#9a3412';ctx.fillText('Platform feedback: previous answers were WRONG: '+q.retryRejected.map(a=>a.join('+')).join(', '),36,y+48);ctx.fillText('Reconsider the visible question. Return a different answer only if confident.',36,y+84);}
         images.push(canvas.toDataURL('image/png'));
     }
     return images;
