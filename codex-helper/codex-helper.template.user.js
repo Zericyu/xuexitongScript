@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.4.2
+// @version      4.4.3
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -210,12 +210,12 @@ method: payload ? 'POST' : 'GET', url: LOCAL_URL + path,
 headers: { 'Content-Type': 'application/json', 'X-Xuexitong-Token': LOCAL_TOKEN },
 data: payload ? JSON.stringify(path==='/answer'?{...payload,session:{id:sessionState.id,deadline:sessionState.deadline}}:payload) : undefined, timeout,
 onload(response) { let data; try { data=JSON.parse(response.responseText); } catch { return reject(new Error('本机服务响应不是 JSON')); }
-if(response.status<200||response.status>=300) reject(new Error(data.error || '本机服务出错')); else resolve(data); },
+if(response.status<200||response.status>=300) reject(Object.assign(new Error(data.error || '本机服务出错'),{code:data.code,retryAt:data.retryAt})); else resolve(data); },
 onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待自动重连')),
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.4.2';
+const SCRIPT_VERSION='4.4.3';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
@@ -431,7 +431,7 @@ panel.dataset.version=SCRIPT_VERSION;
 document.addEventListener('visibilitychange',()=>{if(!monitorStopped&&document.visibilityState==='visible')acquireWakeLock();});
 PAGE.addEventListener('pagehide',()=>disposeIntegrated('页面正在切换'),{once:true});
 
-let codexTimer=null,codexPending=null,codexGeneration=0;
+let codexTimer=null,codexPending=null,codexGeneration=0,codexWaitUntil=0;
 const codexState={connected:false,message:'等待启动',lastCheckedAt:null,busy:false,calls:0};
 function renderCodexConnection(){codexText.textContent='Codex：'+codexState.message;}
 async function checkCodexConnection(){
@@ -442,7 +442,9 @@ async function checkCodexConnection(){
       const health=await bridgeRequest('/health',null,5000);
       if(!health.ok||health.engine!=='codex-cli'||!health.sessions)throw new Error('本机答题服务需更新');
       if(generation!==codexGeneration)return false;
-      Object.assign(codexState,{connected:true,message:health.busy?'已连接 · 正在答题':'已连接 · 遇到章节测验自动答题',lastCheckedAt:Date.now(),busy:Boolean(health.busy),calls:health.calls||0});
+      const waiting=health.retryAt>Date.now()?health.retryAt:codexWaitUntil;
+      const message=waiting>Date.now()?'额度或服务暂不可用 · '+new Date(waiting).toLocaleTimeString()+' 自动重试':health.busy?'已连接 · 正在答题':'已连接 · 遇到章节测验自动答题';
+      Object.assign(codexState,{connected:true,message,lastCheckedAt:Date.now(),busy:Boolean(health.busy),calls:health.calls||0});
       return true;
     }catch(error){
       if(generation!==codexGeneration)return false;
@@ -464,7 +466,7 @@ function startCodexConnection(){
   poll();
 }
 function stopCodexConnection(){
-  clearTimeout(codexTimer);codexTimer=null;codexGeneration++;codexPending=null;
+  clearTimeout(codexTimer);codexTimer=null;codexGeneration++;codexPending=null;codexWaitUntil=0;
   codexState.connected=false;codexState.message='已停止';renderCodexConnection();
 }
 async function ensureCodexReady(){
@@ -477,6 +479,39 @@ async function ensureCodexReady(){
 }
 renderCodexConnection();
 
+async function requestBridgeAnswers(payload,isCurrent){
+  const generation=codexGeneration,sessionId=sessionState.id;
+  let temporaryRetries=0,quotaRetries=0;
+  const assertCurrent=()=>{
+    if(monitorStopped||stoppedByUser()||generation!==codexGeneration||sessionId!==sessionState.id||!isCurrent())throw new Error('等待恢复期间脚本已停止或题目已变化，本次未提交');
+    if(Date.now()>=sessionState.deadline)throw new Error('本次12小时答题会话已结束');
+  };
+  while(true){
+    assertCurrent();
+    try{return await bridgeRequest('/answer',payload);}
+    catch(error){
+      assertCurrent();
+      const quota=error.code==='usage_limit';
+      const temporary=['temporary_connection','rate_limit'].includes(error.code)||/无法连接本机 Codex 服务/.test(error.message||'');
+      if(quota){if(++quotaRetries>3)throw new Error('额度恢复检查已达三次，仍暂不可用，请查看 Codex 用量页面');}
+      else if(temporary){if(++temporaryRetries>3)throw error;}
+      else throw error;
+      const fallback=quota?15*60000:[10000,30000,60000][temporaryRetries-1];
+      const requested=Number.isFinite(error.retryAt)?error.retryAt:Date.now()+fallback;
+      const until=Math.max(Date.now()+1000,requested);
+      codexWaitUntil=until;
+      try{
+        while(Date.now()<until){
+          assertCurrent();
+          const label=quota?'Codex 额度暂不可用':'答题服务暂时不可用';
+          setStatus(label+'，将在 '+new Date(until).toLocaleTimeString()+' 自动重试');
+          await new Promise(resolve=>setTimeout(resolve,Math.min(1000,until-Date.now())));
+        }
+        assertCurrent();setStatus('正在重新连接答题服务');
+      }finally{if(generation===codexGeneration&&codexWaitUntil===until)codexWaitUntil=0;}
+    }
+  }
+}
 
 function createDocumentImageRangeRecovery(){
   const segmentBytes=256*1024,maxBytes=16*1024*1024;
@@ -954,7 +989,7 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
     pause(video);
     if(active?.phase==='answering'){
       if(!same(active.snapshot)){active=null;candidate=null;}
-      else{setStatus('Codex 正在回答视频内弹题 · 已等待 '+Math.floor((Date.now()-active.since)/1000)+' 秒');return;}
+      else{if(typeof codexWaitUntil==='number'&&codexWaitUntil>Date.now())setStatus('正在等待答题服务恢复 · '+new Date(codexWaitUntil).toLocaleTimeString()+' 自动重试');else setStatus('Codex 正在回答视频内弹题 · 已等待 '+Math.floor((Date.now()-active.since)/1000)+' 秒');return;}
     }
     let snapshot;
     try{snapshot=read(video,popup);loadingSince=0;}catch(error){if(!loadingSince)loadingSince=Date.now();if(Date.now()-loadingSince>=15000)fail(error.message+'，请检查视频弹题');else setStatus('正在等待视频弹题内容加载');return;}
@@ -1069,7 +1104,7 @@ const images = await renderQuizImages(questions);
 await ensureCodexReady();
 if(monitorStopped)throw new Error('脚本已停止');
 setStatus('Codex 正在回答 '+questions.length+' 道'+context);
-const data = await bridgeRequest('/answer', {questions:payload, images});
+const data = await requestBridgeAnswers({questions:payload,images},()=>!monitorStopped&&questions.every(q=>q.card.isConnected));
 if(monitorStopped) throw new Error('脚本已停止');
 return data.answers;
 }
@@ -1505,7 +1540,7 @@ const images = await renderQuizImages(questions);
 await ensureCodexReady();
 if(stopped)throw new Error('脚本已停止');
 setStatus('Codex 正在回答 '+questions.length+' 道'+context);
-const data = await bridgeRequest('/answer', {questions:payload, images});
+const data = await requestBridgeAnswers({questions:payload,images},()=>!stopped&&questions.every(q=>q.card.isConnected&&courseDocuments().includes(q.doc)));
 if(stopped) throw new Error('脚本已停止');
 return data.answers;
 }

@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import {spawn} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
+import {cliFailure} from './bridge-failures.mjs';
 
 const root=path.dirname(fileURLToPath(import.meta.url));
 let settings;
@@ -15,7 +16,7 @@ import {prepareRuntime} from './build-userscript.mjs';
 import {resolveCodex} from './resolve-codex.mjs';
 const launchedAt=Date.now();
 const resident=process.argv.includes('--resident');
-let busy=false, calls=0, activeProcess=null;
+let busy=false, calls=0, activeProcess=null, serviceFailure=null;
 const answerCache=new Map();
 export class AnswerSessions {
  constructor(){this.sessions=new Map();}
@@ -76,7 +77,7 @@ async function answer(data){
    child.stdout.on('data',()=>{});
    child.stderr.on('data',chunk=>{tail=(tail+chunk.toString()).slice(-3000);});
    child.once('error',error=>{clearTimeout(timer);if(!settled){settled=true;reject(new Error('无法启动Codex: '+error.message));}});
-   child.once('close',code=>{clearTimeout(timer);activeProcess=null;if(settled)return;settled=true;if(code===0)resolve();else{fs.writeFileSync(path.join(root,'last-codex-error.txt'),tail);reject(new Error(`Codex退出码${code}，请检查本机错误日志`));}});
+   child.once('close',code=>{clearTimeout(timer);activeProcess=null;if(settled)return;settled=true;if(code===0)resolve();else{fs.writeFileSync(path.join(root,'last-codex-error.txt'),tail);reject(cliFailure(tail,code));}});
    child.stdin.on('error',()=>{});child.stdin.end(prompt);
   });
   const result=JSON.parse(fs.readFileSync(output,'utf8'));
@@ -94,7 +95,7 @@ export async function start(){
  const server=http.createServer(async(req,res)=>{
   if(!/^127\.0\.0\.1:\d+$/.test(req.headers.host||''))return respond(res,403,{error:'只接受本机访问'});
   if(!auth(req))return respond(res,401,{error:'本机连接令牌不匹配'});
-  if(req.method==='GET'&&req.url==='/health')return respond(res,200,{ok:true,engine:'codex-cli',busy,calls,resident,sessions:true});
+  if(req.method==='GET'&&req.url==='/health')return respond(res,200,{ok:true,engine:'codex-cli',busy,calls,resident,sessions:true,retryAt:serviceFailure?.retryAt||null,unavailableReason:serviceFailure?.code||null});
   if(req.method==='POST'&&req.url==='/stop'){fs.writeFileSync(path.join(root,'watchdog-stop'),'stopped\n');respond(res,200,{ok:true});activeProcess?.kill();server.close();return;}
   if(req.method==='POST'&&req.url==='/event'){
    try{let body='';for await(const chunk of req){body+=chunk;if(body.length>4096)throw new Error('事件过长');}
@@ -103,6 +104,7 @@ export async function start(){
    }catch(e){return respond(res,400,{error:e.message});}
   }
   if(req.method!=='POST'||req.url!=='/answer')return respond(res,404,{error:'没有此接口'});
+  if(serviceFailure?.retryAt>Date.now())return respond(res,serviceFailure.status,{error:serviceFailure.message,code:serviceFailure.code,retryAt:serviceFailure.retryAt});
   if(busy)return respond(res,409,{error:'已有章节测验正在处理，请勿重复启动'});
   if(!resident&&calls>=150)return respond(res,429,{error:'达到本次150套题上限，服务需重新启动'});
   busy=true;
@@ -115,12 +117,12 @@ export async function start(){
    if(answerCache.has(digest)){event('cached_answer',{questions:data.questions.length});return respond(res,200,{answers:answerCache.get(digest)});}
    if(session)answerSessions.charge(session);
    calls++;event('request_started',{questions:data.questions.length,call:calls});
-   const answers=await answer(data);
+   const answers=await answer(data);serviceFailure=null;
    if(answerCache.size>=150)answerCache.delete(answerCache.keys().next().value);
    answerCache.set(digest,answers);
    event('answer_ready',{questions:answers.length,call:calls});
    respond(res,200,{answers});
-  }catch(error){event('request_failed',{message:error.message});respond(res,422,{error:error.message});}
+  }catch(error){if(error.retryAt)serviceFailure={message:error.message,code:error.code,retryAt:error.retryAt,status:error.status||503};event('request_failed',{message:error.message,code:error.code,retryAt:error.retryAt});respond(res,error.status||422,{error:error.message,code:error.code,retryAt:error.retryAt});}
   finally{busy=false;}
  });
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(settings.port,'127.0.0.1',resolve);});
