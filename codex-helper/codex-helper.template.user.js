@@ -271,6 +271,9 @@ async function acquireWakeLock(){
   finally{if(generation===wakeGeneration){wakePending=false;renderMonitor();}}
 }
 function releaseWakeLock(){wakeGeneration++;wakePending=false;const lock=wakeLock;wakeLock=null;wakeMessage='已释放';if(lock&&!lock.released)Promise.resolve(lock.release()).catch(()=>{});}
+function nativeVideoCompleted(video){
+  try{return Boolean(video?.ownerDocument?.defaultView?.frameElement?.closest('.ans-attach-ct')?.classList.contains('ans-job-finished'));}catch{return false;}
+}
 function engineSnapshot(){
   if(engineType==='continuous')return PAGE.__codexCoursePlayback?.snapshot()||null;
   const app=PAGE[APP_KEY];if(!app)return null;
@@ -338,7 +341,9 @@ async function monitorTickOnce(generation){
   const snapshot=engineSnapshot();if(!snapshot)return;
   if(snapshot.quizFailure){finishIntegrated(snapshot.quizFailure,'needs_attention');return;}
   if(engineType==='chapter'){
-    const endedAction=checkEndedTransition(snapshot);
+    const nativeComplete=nativeVideoCompleted(PAGE[APP_KEY]?._getVideoEl?.());
+    if(nativeComplete&&!snapshot.busy)try{PAGE[APP_KEY]?._getVideoEl?.()?.pause();}catch{}
+    const endedAction=checkEndedTransition(nativeComplete?{...snapshot,ended:true}:snapshot);
     if(endedAction==='advance'){setStatus('视频已结束，正在恢复下一学习步骤');PAGE[APP_KEY]?.nextUnit?.();return;}
     if(endedAction==='failed'){finishIntegrated('视频已结束，但下一学习步骤仍未打开','needs_attention');return;}
   }
@@ -728,7 +733,7 @@ function createChapterFlowAdapter(app){
     scan(root.doc,0);
     return {...root,documents,videos};
   }
-  const unfinishedVideo=state=>state.videos.some(video=>!video.ended);
+  const unfinishedVideo=state=>state.videos.some(video=>!video.ended&&!(typeof nativeVideoCompleted==='function'&&nativeVideoCompleted(video)));
   function stopReading(){
     if(timer!==null)clearInterval(timer);timer=null;reading=false;readingChapter=null;readingDocument=null;readingFrames=null;reader.reset();
   }

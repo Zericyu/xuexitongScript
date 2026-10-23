@@ -1,0 +1,11 @@
+const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict');
+const source=fs.readFileSync(path.join(__dirname,'../codex-helper.template.user.js'),'utf8');
+const helper=source.slice(source.indexOf('function nativeVideoCompleted('),source.indexOf('function engineSnapshot()'));
+const complete=vm.runInNewContext('(()=>{'+helper+'return nativeVideoCompleted})()');
+const video=finished=>({ownerDocument:{defaultView:{frameElement:{closest:selector=>selector==='.ans-attach-ct'?{classList:{contains:name=>finished&&name==='ans-job-finished'}}:null}}}});
+assert.equal(complete(video(true)),true);assert.equal(complete(video(false)),false);assert.equal(complete(null),false);assert.equal(complete({ownerDocument:{defaultView:{get frameElement(){throw new Error('blocked')}}}}),false);
+const unfinished=vm.runInNewContext(source.match(/const unfinishedVideo=(state=>[^;]+);/)[1],{nativeVideoCompleted:complete});
+assert.equal(unfinished({videos:[{...video(true),ended:false}]}),false);
+assert.equal(unfinished({videos:[{...video(false),ended:false}]}),true);
+assert.equal(unfinished({videos:[{...video(false),ended:true}]}),false);
+console.log('PASS: native completion, missing/inaccessible frames, completed-video chapter flow');
