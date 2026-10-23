@@ -4,3 +4,5 @@ bridge-process.json
 bridge-events.jsonl
 last-codex-error.txt
 *.log
+watchdog-stop
+watchdog-status.json

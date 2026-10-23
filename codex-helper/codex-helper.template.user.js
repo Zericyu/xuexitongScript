@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.4.0
+// @version      4.4.1
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -215,7 +215,7 @@ onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待�
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.4.0';
+const SCRIPT_VERSION='4.4.1';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
@@ -345,7 +345,7 @@ async function monitorTickOnce(generation){
     if(nativeComplete&&!snapshot.busy)try{PAGE[APP_KEY]?._getVideoEl?.()?.pause();}catch{}
     const endedAction=checkEndedTransition(nativeComplete?{...snapshot,ended:true}:snapshot);
     if(endedAction==='advance'){setStatus('视频已结束，正在恢复下一学习步骤');PAGE[APP_KEY]?.nextUnit?.();return;}
-    if(endedAction==='failed'){finishIntegrated('视频已结束，但下一学习步骤仍未打开','needs_attention');return;}
+    if(endedAction==='failed'){recoverIntegrated('视频已结束，下一学习步骤加载超时',snapshot);return;}
   }
   if(engineType==='chapter'&&snapshot.reachedDirectoryEnd&&snapshot.catalogSize>0&&!snapshot.busy&&!snapshot.mediaError&&snapshot.remainingTasks===0){finishIntegrated('本课程目录中的任务点已全部完成','complete');return;}
   const identity=snapshot.chapter+'|'+snapshot.title;
@@ -454,22 +454,29 @@ async function checkCodexConnection(){
   try{return await request;}finally{if(codexPending===request)codexPending=null;}
 }
 function startCodexConnection(){
-  clearInterval(codexTimer);codexState.message='正在自动连接';renderCodexConnection();
-  checkCodexConnection();codexTimer=setInterval(checkCodexConnection,30000);
+  clearTimeout(codexTimer);const generation=++codexGeneration;
+  codexState.message='正在自动连接';renderCodexConnection();
+  const poll=async()=>{
+    try{await checkCodexConnection();}finally{
+      if(generation===codexGeneration)codexTimer=setTimeout(poll,codexState.connected?30000:5000);
+    }
+  };
+  poll();
 }
 function stopCodexConnection(){
-  clearInterval(codexTimer);codexTimer=null;codexGeneration++;codexPending=null;
+  clearTimeout(codexTimer);codexTimer=null;codexGeneration++;codexPending=null;
   codexState.connected=false;codexState.message='已停止';renderCodexConnection();
 }
 async function ensureCodexReady(){
-  for(let attempt=0;attempt<6;attempt++){
+  for(let attempt=0;attempt<12;attempt++){
     if(stoppedByUser()||monitorStopped)throw new Error('脚本已停止');
     if(await checkCodexConnection())return;
-    if(attempt<5){setStatus('正在等待 Codex 自动连接');await new Promise(resolve=>setTimeout(resolve,5000));}
+    if(attempt<11){setStatus('正在等待本机服务自动恢复连接');await new Promise(resolve=>setTimeout(resolve,5000));}
   }
   throw new Error('Codex 本机服务未连接，请检查自动接入服务后点击开始继续');
 }
 renderCodexConnection();
+
 
 function createDocumentImageRangeRecovery(){
   const segmentBytes=256*1024,maxBytes=16*1024*1024;

@@ -6,6 +6,7 @@ import { validateSettings } from './build-userscript.mjs';
 const root = path.dirname(fileURLToPath(import.meta.url));
 try {
     const settings = validateSettings(JSON.parse(fs.readFileSync(path.join(root, 'bridge-settings.json'), 'utf8')));
+    fs.writeFileSync(path.join(root, 'watchdog-stop'), 'stopped\n');
     const response = await fetch(`http://127.0.0.1:${settings.port}/stop`, {
         method: 'POST', headers: { 'X-Xuexitong-Token': settings.token }, signal: AbortSignal.timeout(3000),
     });

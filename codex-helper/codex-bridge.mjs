@@ -95,7 +95,7 @@ export async function start(){
   if(!/^127\.0\.0\.1:\d+$/.test(req.headers.host||''))return respond(res,403,{error:'只接受本机访问'});
   if(!auth(req))return respond(res,401,{error:'本机连接令牌不匹配'});
   if(req.method==='GET'&&req.url==='/health')return respond(res,200,{ok:true,engine:'codex-cli',busy,calls,resident,sessions:true});
-  if(req.method==='POST'&&req.url==='/stop'){respond(res,200,{ok:true});activeProcess?.kill();server.close();return;}
+  if(req.method==='POST'&&req.url==='/stop'){fs.writeFileSync(path.join(root,'watchdog-stop'),'stopped\n');respond(res,200,{ok:true});activeProcess?.kill();server.close();return;}
   if(req.method==='POST'&&req.url==='/event'){
    try{let body='';for await(const chunk of req){body+=chunk;if(body.length>4096)throw new Error('事件过长');}
    const data=JSON.parse(body);if(data.kind!=='quiz_completed'||typeof data.chapter!=='string'||data.chapter.length>200||data.score!==null&&!/^\d+(\.\d+)?$/.test(String(data.score)))throw new Error('事件格式错误');
