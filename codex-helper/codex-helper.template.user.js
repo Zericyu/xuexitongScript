@@ -715,13 +715,14 @@ function createChapterFlowAdapter(app){
     try{return {frame,doc:frame?.contentDocument||null};}catch{return {frame,doc:null};}
   }
   function items(){
-    const root=content(),documents=[],videos=[],seen=new Set();
+    const root=content(),documents=[],videos=[],videoFrames=[],seen=new Set();
     function scan(doc,depth){
       if(!doc||seen.has(doc)||depth>4)return;seen.add(doc);
       for(const video of doc.querySelectorAll('video'))if(visible(video))videos.push(video);
       for(const frame of doc.querySelectorAll('iframe')){
         if(!visible(frame))continue;
         const src=frame.getAttribute('src')||frame.src||'';
+        if(/\/ananas\/modules\/video\//.test(src))videoFrames.push(frame);
         if(/\/ananas\/modules\/(pdf|ppt)\//.test(src)){
           let data={};try{data=JSON.parse(frame.getAttribute('data')||'{}');}catch{}
           documents.push({frame,wrapper:frame.closest('.ans-attach-ct')||frame.parentElement,title:data.name||chapterName()||'课程文档'});
@@ -731,9 +732,12 @@ function createChapterFlowAdapter(app){
       }
     }
     scan(root.doc,0);
-    return {...root,documents,videos};
+    return {...root,documents,videos,videoFrames};
   }
-  const unfinishedVideo=state=>state.videos.some(video=>!video.ended&&!(typeof nativeVideoCompleted==='function'&&nativeVideoCompleted(video)));
+  const unfinishedVideo=state=>state.videos.some(video=>!video.ended&&!(typeof nativeVideoCompleted==='function'&&nativeVideoCompleted(video)))||state.videoFrames.some(frame=>{
+    if(frame.closest('.ans-attach-ct')?.classList.contains('ans-job-finished'))return false;
+    try{const video=frame.contentDocument?.querySelector('video');return !video||!video.ended;}catch{return true;}
+  });
   function stopReading(){
     if(timer!==null)clearInterval(timer);timer=null;reading=false;readingChapter=null;readingDocument=null;readingFrames=null;reader.reset();
   }
@@ -804,6 +808,34 @@ function createChapterFlowAdapter(app){
   function readingSnapshot(){return reading?reader.snapshot()||{phase:'loading',title:chapterName()}:null;}
   function dispose(){disposed=true;stopReading();reader.dispose();}
   return {beforeAdvance,isReadableStep,startReading,readingSnapshot,dispose};
+}
+
+function selectChapterVideo(candidates){
+  const videos=Array.from(candidates);
+  const native=videos.filter(video=>{
+    try{
+      const frame=video.ownerDocument.defaultView.frameElement;
+      return /\/ananas\/modules\/video\//.test(frame.getAttribute('src')||frame.src||'')&&Boolean(frame.closest('.ans-attach-ct'));
+    }catch{return false;}
+  });
+  // Native attachments are ordered course content, including players not yet loaded.
+  const pending=native.find(video=>!video.ended&&!nativeVideoCompleted(video));
+  if(pending)return pending;
+  const score=video=>Number(video.readyState||0)*10+(Number.isFinite(video.duration)&&video.duration>0?2:0)+(!video.paused?1:0);
+  return videos.sort((a,b)=>score(b)-score(a))[0]||null;
+}
+const startedChapterVideos=new WeakSet();
+function prepareChapterVideo(video){
+  if(!video||video.readyState>0||startedChapterVideos.has(video))return;
+  try{
+    const frame=video.ownerDocument.defaultView.frameElement;
+    if(!/\/ananas\/modules\/video\//.test(frame?.getAttribute('src')||frame?.src||'')||!frame.closest('.ans-attach-ct'))return;
+    const button=video.ownerDocument.querySelector('button.vjs-big-play-button');
+    if(!button?.getClientRects().length)return;
+    const style=video.ownerDocument.defaultView.getComputedStyle(button);
+    if(style.display==='none'||style.visibility==='hidden')return;
+    startedChapterVideos.add(video);frame.scrollIntoView({block:'center'});button.click();
+  }catch{}
 }
 
 function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,storageKey}){
@@ -1875,6 +1907,7 @@ try {
 el.muted = true;
 el.defaultMuted = true;
 el.volume = 0;
+prepareChapterVideo(el);
 await el.play();
 this._tryTimes = 0;
 console.log('%c视频开始播放，保持页面默认播放速度', 'color:#4CAF50');
@@ -2114,11 +2147,7 @@ return this._treeContainerEl;
                     }
                 };
                 scan(document, 0);
-                // Some pages retain an empty video beside the loaded lesson player.
-                const score = (video) => Number(video.readyState || 0) * 10 +
-                    (Number.isFinite(video.duration) && video.duration > 0 ? 2 : 0) +
-                    (!video.paused ? 1 : 0);
-                this._videoEl = [...candidates].sort((a, b) => score(b) - score(a))[0] || null;
+                this._videoEl = selectChapterVideo(candidates);
                 return this._videoEl;
             },
 _videoEventHandle() {

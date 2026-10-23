@@ -4,8 +4,9 @@ const helper=source.slice(source.indexOf('function nativeVideoCompleted('),sourc
 const complete=vm.runInNewContext('(()=>{'+helper+'return nativeVideoCompleted})()');
 const video=finished=>({ownerDocument:{defaultView:{frameElement:{closest:selector=>selector==='.ans-attach-ct'?{classList:{contains:name=>finished&&name==='ans-job-finished'}}:null}}}});
 assert.equal(complete(video(true)),true);assert.equal(complete(video(false)),false);assert.equal(complete(null),false);assert.equal(complete({ownerDocument:{defaultView:{get frameElement(){throw new Error('blocked')}}}}),false);
-const unfinished=vm.runInNewContext(source.match(/const unfinishedVideo=(state=>[^;]+);/)[1],{nativeVideoCompleted:complete});
-assert.equal(unfinished({videos:[{...video(true),ended:false}]}),false);
-assert.equal(unfinished({videos:[{...video(false),ended:false}]}),true);
-assert.equal(unfinished({videos:[{...video(false),ended:true}]}),false);
+const start=source.indexOf('const unfinishedVideo=');
+const unfinished=vm.runInNewContext(source.slice(start+'const unfinishedVideo='.length,source.indexOf('function stopReading()',start)).trim().replace(/;$/,''),{nativeVideoCompleted:complete});
+assert.equal(unfinished({videos:[{...video(true),ended:false}],videoFrames:[]}),false);
+assert.equal(unfinished({videos:[{...video(false),ended:false}],videoFrames:[]}),true);
+assert.equal(unfinished({videos:[{...video(false),ended:true}],videoFrames:[]}),false);
 console.log('PASS: native completion, missing/inaccessible frames, completed-video chapter flow');
