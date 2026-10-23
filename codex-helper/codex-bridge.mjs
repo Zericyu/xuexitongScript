@@ -14,8 +14,25 @@ const schemaPath=path.join(root,'answer-schema.json');
 import {prepareRuntime} from './build-userscript.mjs';
 import {resolveCodex} from './resolve-codex.mjs';
 const launchedAt=Date.now();
+const resident=process.argv.includes('--resident');
 let busy=false, calls=0, activeProcess=null;
 const answerCache=new Map();
+export class AnswerSessions {
+ constructor(){this.sessions=new Map();}
+ get(session,now=Date.now()){
+  if(!session||typeof session.id!=='string'||!/^[a-z0-9-]{8,80}$/i.test(session.id)||!Number.isFinite(session.deadline)||session.deadline<=now)throw new Error('答题会话无效或已结束，请点击开始继续');
+  for(const [id,item] of this.sessions)if(item.deadline<now-24*3600000)this.sessions.delete(id);
+  let record=this.sessions.get(session.id);
+  if(!record){
+   if(this.sessions.size>=100)throw new Error('答题会话过多，请关闭其他课程页面');
+   record={deadline:Math.min(session.deadline,now+12*3600000),calls:0};this.sessions.set(session.id,record);
+  }else record.deadline=Math.min(record.deadline,session.deadline);
+  if(record.deadline<=now)throw new Error('本次12小时答题会话已结束');
+  return record;
+ }
+ charge(record){if(record.calls>=150)throw new Error('达到本轮150套题上限，请检查后点击开始继续');record.calls++;}
+}
+const answerSessions=new AnswerSessions();
 const event=(kind,detail={})=>fs.appendFileSync(logPath,JSON.stringify({time:new Date().toISOString(),kind,...detail})+'\n');
 function auth(req){const actual=Buffer.from(String(req.headers['x-xuexitong-token']||''));const expected=Buffer.from(settings.token);return actual.length===expected.length&&crypto.timingSafeEqual(actual,expected);}
 function respond(res,status,payload){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(payload));}
@@ -28,7 +45,6 @@ export function validatePayload(data){
   if(!Array.isArray(q.options)||q.options.length<2||q.options.length>8||new Set(q.options.map(o=>o.letter)).size!==q.options.length)throw new Error('选项数量不符合要求');
   if(q.options.some(o=>!/^[A-H]$/.test(o.letter)||typeof o.text!=='string'||o.text.length>2000))throw new Error('选项格式不符合要求');
   if(typeof data.images[i]!=='string'||!/^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(data.images[i])||data.images[i].length>1500000)throw new Error('题目图片格式或大小不符合要求');
-  if(Buffer.from(data.images[i].split(',')[1],'base64').subarray(0,8).toString('hex')!=='89504e470d0a1a0a')throw new Error('不是PNG图片');
  }
  return data;
 }
@@ -78,7 +94,7 @@ export async function start(){
  const server=http.createServer(async(req,res)=>{
   if(!/^127\.0\.0\.1:\d+$/.test(req.headers.host||''))return respond(res,403,{error:'只接受本机访问'});
   if(!auth(req))return respond(res,401,{error:'本机连接令牌不匹配'});
-  if(req.method==='GET'&&req.url==='/health')return respond(res,200,{ok:true,engine:'codex-cli',busy,calls});
+  if(req.method==='GET'&&req.url==='/health')return respond(res,200,{ok:true,engine:'codex-cli',busy,calls,resident,sessions:true});
   if(req.method==='POST'&&req.url==='/stop'){respond(res,200,{ok:true});activeProcess?.kill();server.close();return;}
   if(req.method==='POST'&&req.url==='/event'){
    try{let body='';for await(const chunk of req){body+=chunk;if(body.length>4096)throw new Error('事件过长');}
@@ -88,14 +104,16 @@ export async function start(){
   }
   if(req.method!=='POST'||req.url!=='/answer')return respond(res,404,{error:'没有此接口'});
   if(busy)return respond(res,409,{error:'已有章节测验正在处理，请勿重复启动'});
-  if(calls>=150)return respond(res,429,{error:'达到本次150套题上限，服务需重新启动'});
+  if(!resident&&calls>=150)return respond(res,429,{error:'达到本次150套题上限，服务需重新启动'});
   busy=true;
   try{
    const chunks=[];let size=0;
    for await(const chunk of req){size+=chunk.length;if(size>10000000)throw new Error('请求过大');chunks.push(chunk);}
    const data=validatePayload(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+   const session=resident||data.session?answerSessions.get(data.session):null;
    const digest=crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
    if(answerCache.has(digest)){event('cached_answer',{questions:data.questions.length});return respond(res,200,{answers:answerCache.get(digest)});}
+   if(session)answerSessions.charge(session);
    calls++;event('request_started',{questions:data.questions.length,call:calls});
    const answers=await answer(data);
    if(answerCache.size>=150)answerCache.delete(answerCache.keys().next().value);
@@ -107,12 +125,10 @@ export async function start(){
  });
  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(settings.port,'127.0.0.1',resolve);});
  event('started',{pid:process.pid,port:settings.port});
- fs.writeFileSync(path.join(root,'bridge-process.json'),JSON.stringify({pid:process.pid,startedAt:new Date().toISOString(),deadline:new Date(launchedAt+12*3600000).toISOString()},null,2));
- const deadline=setTimeout(()=>{activeProcess?.kill();server.close();},12*3600000);deadline.unref();
- const stop=()=>{activeProcess?.kill();server.close();};
- process.on('SIGTERM',stop);
- process.on('SIGINT',stop);
- console.log('Codex本机服务已启动，仅处理章节练习；最长运行12小时。');
+ fs.writeFileSync(path.join(root,'bridge-process.json'),JSON.stringify({pid:process.pid,startedAt:new Date().toISOString(),resident,deadline:resident?null:new Date(launchedAt+12*3600000).toISOString()},null,2));
+ if(!resident){const deadline=setTimeout(()=>{activeProcess?.kill();server.close();},12*3600000);deadline.unref();}
+ process.on('SIGTERM',()=>{activeProcess?.kill();server.close();});
+ console.log(resident?'Codex自动接入服务已就绪，仅在请求章节练习时调用；每轮最多12小时、150套题。':'Codex本机服务已启动，仅处理章节练习；最长运行12小时。');
  return server;
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url))start().catch(e=>{console.error(e.message);process.exitCode=1;});

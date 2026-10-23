@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('../codex-helper.template.user.js', import.meta.url), 'utf8');
 
 function helpers(context) {
-    const start = source.indexOf('function validateAnswers(');
+    const start = source.indexOf('function validateAnswers(', source.indexOf('function attachQuizAutomation(app)'));
     const end = source.indexOf('async function confirmSubmitDialog()', start);
     return vm.runInNewContext('(()=>{' + source.slice(start, end) + ';return{validateAnswers,selectAnswers,selectedLetters,questionKeys}})()', context);
 }
