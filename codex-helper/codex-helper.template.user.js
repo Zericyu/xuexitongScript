@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.4.1
+// @version      4.4.2
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -215,7 +215,7 @@ onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待�
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.4.1';
+const SCRIPT_VERSION='4.4.2';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
@@ -967,6 +967,34 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
   return {tick,isBlocking,dispose};
 }
 
+async function answerWithReview(questions,{ask,validate,isCurrent,setStatus,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms))}){
+  const assertCurrent=()=>{if(!isCurrent()||questions.some(q=>!q.card?.isConnected))throw new Error('复核期间页面已变化或脚本已停止，本次未提交');};
+  const uncertain=error=>/第\s*\d+\s*题识别或(?:作答|答案)不确定/.test(error?.message||'');
+  assertCurrent();
+  try{
+    const raw=await ask(questions);assertCurrent();return validate(questions,raw);
+  }catch(error){if(!uncertain(error))throw error;}
+  // Re-render each visible question separately. Never relabel low confidence as high.
+  const result=new Map();
+  for(let index=0;index<questions.length;index++){
+    const single=[questions[index]];
+    for(let attempt=0;attempt<2;attempt++){
+      assertCurrent();
+      setStatus('识别未确定，正在单题复核 '+(index+1)+' / '+questions.length+'（'+(attempt+1)+' / 2）');
+      await wait(attempt===0?1000:3000);assertCurrent();
+      try{
+        const raw=await ask(single);assertCurrent();
+        const verified=validate(single,raw);
+        result.set(index+1,verified.get(1));break;
+      }catch(error){
+        if(!uncertain(error))throw error;
+        if(attempt===1)throw new Error('第 '+(index+1)+' 题经两次单题复核仍不确定，需要处理；本次未提交');
+      }
+    }
+  }
+  assertCurrent();return result;
+}
+
 function createVideoAnswerTools(){
 const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
 async function renderQuizImages(questions) {
@@ -1068,7 +1096,7 @@ return result;
 }
 
 
-return async questions=>validateAnswers(questions,await askCodex(questions,'视频弹题'));
+return async questions=>answerWithReview(questions,{ask:qs=>askCodex(qs,'视频弹题'),validate:validateAnswers,isCurrent:()=>!monitorStopped,setStatus});
 }
 const requestVideoAnswers=createVideoAnswerTools();
 
@@ -1680,7 +1708,7 @@ const journal='codexQuiz:'+signature;
 if(sessionStorage.getItem(journal)==='submitting') throw new Error('上次提交结果未确认，请人工检查，本次不重复提交');
 if (attemptedQuizzes.has(signature)) throw new Error('本次测验已尝试过，已停止重复提交');
 console.log(`识别到 ${questions.length} 道题，正在调用 Codex`);
-const answers = validateAnswers(questions, await askCodex(questions));
+const answers = await answerWithReview(questions,{ask:askCodex,validate:validateAnswers,isCurrent:()=>!stopped&&identity===stepIdentity()&&questions.every(q=>courseDocuments().includes(q.doc)),setStatus});
 if(stopped || identity!==stepIdentity() || questions.some(q=>!q.card.isConnected || !courseDocuments().includes(q.doc))) throw new Error('等待期间章节已变化，本次不提交');
 assertChapterOnly(questions[0].doc);
 console.table(questions.map((q, i) => ({ 题号: i + 1, 题型: q.kind, 选择: answers.get(i + 1).join('') })));
