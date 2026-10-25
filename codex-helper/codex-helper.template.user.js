@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.4.4
+// @version      4.4.5
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -215,7 +215,7 @@ onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待�
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.4.4';
+const SCRIPT_VERSION='4.4.5';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
@@ -236,6 +236,7 @@ function checkEndedTransition(snapshot,now=Date.now()){
   return '';
 }
 let videoQuestions=null,videoQuestionTimer=null;
+let chapterLineRecovery=null;
 function saveSession(){try{sessionStorage.setItem(monitorStorageKey,JSON.stringify(sessionState));}catch{}}
 function remainingTasks(){return Array.from(document.querySelectorAll('#coursetree .posCatalog_select:not(.firstLayer) .orangeNew')).reduce((sum,e)=>sum+Number(e.textContent.trim()||0),0);}
 function trackPlaybackProgress(identity,time){
@@ -288,6 +289,7 @@ function disposeIntegrated(reason='页面正在切换'){
   monitorStopped=true;
   clearInterval(monitorTimer);monitorTimer=null;
   clearInterval(videoQuestionTimer);videoQuestionTimer=null;videoQuestions?.dispose();videoQuestions=null;
+  chapterLineRecovery?.dispose();chapterLineRecovery=null;
   stopCodexConnection();
   if(PAGE[BOOT_TIMER_KEY])clearInterval(PAGE[BOOT_TIMER_KEY]);
   PAGE[BOOT_TIMER_KEY]=null;
@@ -316,6 +318,23 @@ function recoverIntegrated(reason,snapshot){
   monitorMode='recovering';setStatus('正在恢复播放：'+reason);renderMonitor();
   disposeIntegrated('正在重新加载播放器');
   PAGE.location.reload();
+}
+function chapterNetworkState(snapshot){
+  let video,frame;
+  try{
+    video=PAGE[APP_KEY]?._getVideoEl?.();frame=video?.ownerDocument?.defaultView?.frameElement;
+    if(!frame||frame.contentDocument!==video.ownerDocument||!/\/ananas\/modules\/video\//.test(frame.getAttribute('src')||frame.src||''))return '';
+  }catch{return '';}
+  if(!chapterLineRecovery)chapterLineRecovery=createPlaybackLineRecovery({storageKey:identity=>'codexChapterVideoLines:'+courseContext+':'+sessionState.id+':'+identity,setStatus});
+  if(chapterLineRecovery.isPending(frame))return 'pending';
+  if(chapterLineRecovery.hasFailed(frame))return 'failed';
+  let data={};try{data=JSON.parse(frame.getAttribute('data')||'{}');}catch{}
+  const attachment=String(data.objectid||data.objectId||data._jobid||data.jobid||'');
+  const index=Array.from(frame.ownerDocument.querySelectorAll('iframe')).filter(item=>/\/ananas\/modules\/video\//.test(item.getAttribute('src')||item.src||'')).indexOf(frame);
+  if(!attachment&&index<0)return '';
+  // Native attachment identity survives CDN changes and signed media URLs.
+  const identity=snapshot.chapter+'|'+snapshot.title+'|'+(attachment?'attachment:'+attachment:'attachment-index:'+index);
+  return snapshot.mediaError===2&&chapterLineRecovery.tryRecover(frame,identity)?'pending':'';
 }
 function monitorTick(){
   if(monitorPending)return monitorPending;
@@ -360,7 +379,12 @@ async function monitorTickOnce(generation){
     if(/加载失败|播放进度超过|播放器未能继续|页面发生变化/.test(snapshot.message)){recoverIntegrated(snapshot.message,snapshot);return;}
     finishIntegrated(snapshot.message,'needs_attention');return;
   }
-  if(snapshot.busy){lastProgress=Date.now();renderMonitor();await acquireWakeLock();return;}
+  if(snapshot.busy){chapterLineRecovery?.dispose();chapterLineRecovery=null;lastProgress=Date.now();renderMonitor();await acquireWakeLock();return;}
+  if(engineType==='chapter'){
+    const network=chapterNetworkState(snapshot);
+    if(network==='pending'){lastProgress=Date.now();setStatus('正在等待备用线路恢复实际播放');renderMonitor();await acquireWakeLock();return;}
+    if(network==='failed'){recoverIntegrated('备用线路35秒内未恢复实际播放',snapshot);return;}
+  }
   if(snapshot.mediaError){
     if(snapshot.mediaError===2&&engineType==='continuous'&&PAGE.__codexCoursePlayback?.recoverLine?.()){lastProgress=Date.now();renderMonitor();await acquireWakeLock();return;}
     recoverIntegrated('播放器报告媒体加载错误',snapshot);return;
@@ -676,17 +700,19 @@ function createDocumentReader({courseId,chapterName,setStatus}){
 }
 
 function createPlaybackLineRecovery({storageKey,setStatus}){
-  const pending=new Map();
+  const pending=new Map(),failed=new Set();
   const getVideo=frame=>{try{return frame.contentDocument?.querySelector('video')||null;}catch{return null;}};
   function isPending(frame){
     const wait=pending.get(frame);
     if(!wait)return false;
     const video=getVideo(frame);
-    if(!video||Date.now()>=wait.until||!video.error&&video.readyState>=2&&video.currentTime-wait.baseline>0.2){pending.delete(frame);return false;}
+    if(video&&!video.error&&video.readyState>=2&&video.currentTime-wait.baseline>0.2){pending.delete(frame);failed.delete(frame);return false;}
+    if(!video||Date.now()>=wait.until){pending.delete(frame);failed.add(frame);return false;}
     return true;
   }
   function tryRecover(frame,title){
     if(isPending(frame))return true;
+    if(failed.has(frame))return false;
     const video=getVideo(frame);
     if(video?.error?.code!==2)return false;
     try{
@@ -708,7 +734,7 @@ function createPlaybackLineRecovery({storageKey,setStatus}){
       return true;
     }catch{pending.delete(frame);return false;}
   }
-  return {tryRecover,isPending,dispose(){pending.clear();}};
+  return {tryRecover,isPending,hasFailed:frame=>failed.has(frame),dispose(){pending.clear();failed.clear();}};
 }
 
 function createPlaybackSpeedController(){
@@ -2239,7 +2265,7 @@ return this._treeContainerEl;
 },
             _isCurrentVideo(video) {
                 try {
-                    if (!video || !video.isConnected || video.error) return false;
+                    if (!video || !video.isConnected) return false;
                     const visible = (element) => {
                         if (!element.getClientRects().length) return false;
                         const style = element.ownerDocument.defaultView.getComputedStyle(element);
