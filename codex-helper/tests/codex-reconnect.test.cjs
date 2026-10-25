@@ -1,6 +1,6 @@
 const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
 const full=fs.readFileSync(require('node:path').join(__dirname,'../codex-helper.template.user.js'),'utf8');
-const s=full.slice(full.indexOf('let codexTimer='),full.indexOf('renderCodexConnection();',full.indexOf('async function ensureCodexReady()'))+'renderCodexConnection();'.length);
+const s=full.slice(full.indexOf('let codexTimer='),full.indexOf('async function requestBridgeAnswers('));
 let connected=false,resolvePending=null,timers=[],calls=0;
 const context=vm.createContext({codexText:{},Date,monitorStopped:false,stoppedByUser:()=>false,setStatus:()=>{},
   bridgeRequest:async()=>{calls++;if(resolvePending)await new Promise(r=>resolvePending=r);if(!connected)throw Error('offline');return {ok:true,engine:'codex-cli',sessions:true};},

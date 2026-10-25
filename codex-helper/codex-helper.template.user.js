@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.4.3
+// @version      4.4.4
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -215,7 +215,7 @@ onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待�
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.4.3';
+const SCRIPT_VERSION='4.4.4';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
@@ -382,7 +382,7 @@ function startIntegratedEngine(){
   if(!prepareCourseQueue()){monitorStopped=true;monitorMode='stopped';setStatus('课程队列已停止或正在其他课程运行，点击开始继续');renderMonitor();return;}
   monitorStopped=false;monitorMode='running';lastIdentity='';lastTime=null;lastProgress=Date.now();stopButton.disabled=false;
   startCodexConnection();
-  videoQuestions=createVideoPopupQuestions({getVideo:()=>engineType==='continuous'?PAGE.__codexCoursePlayback?.getVideo?.():PAGE[APP_KEY]?._getVideoEl?.(),requestAnswers:requestVideoAnswers,setStatus,onError:message=>finishIntegrated(message,'needs_attention'),storageKey:'codexVideoPopup:'+courseContext});
+  videoQuestions=createVideoPopupQuestions({getVideo:()=>engineType==='continuous'?PAGE.__codexCoursePlayback?.getVideo?.():PAGE[APP_KEY]?._getVideoEl?.(),requestAnswers:requestVideoAnswers,setStatus,onError:message=>{setStatus(message);notifyUser(message);},storageKey:'codexVideoPopup:'+courseContext});
   videoQuestionTimer=setInterval(()=>{try{videoQuestions?.tick();}catch(error){finishIntegrated('视频弹题检查失败：'+error.message,'needs_attention');}},1000);
   if(hasChapterQuizLayout()){
     if(!PAGE.jQuery){finishIntegrated('课程播放器尚未就绪，请稍后点击开始','needs_attention');return;}
@@ -469,10 +469,12 @@ function stopCodexConnection(){
   clearTimeout(codexTimer);codexTimer=null;codexGeneration++;codexPending=null;codexWaitUntil=0;
   codexState.connected=false;codexState.message='已停止';renderCodexConnection();
 }
-async function ensureCodexReady(){
+async function ensureCodexReady(isCurrent=()=>true){
   for(let attempt=0;attempt<12;attempt++){
-    if(stoppedByUser()||monitorStopped)throw new Error('脚本已停止');
-    if(await checkCodexConnection())return;
+    if(stoppedByUser()||monitorStopped||!isCurrent())throw new Error('脚本已停止或当前弹题已转为人工处理');
+    const connected=await checkCodexConnection();
+    if(!isCurrent())throw new Error('当前弹题已变化或转为人工处理');
+    if(connected)return;
     if(attempt<11){setStatus('正在等待本机服务自动恢复连接');await new Promise(resolve=>setTimeout(resolve,5000));}
   }
   throw new Error('Codex 本机服务未连接，请检查自动接入服务后点击开始继续');
@@ -881,7 +883,7 @@ function prepareChapterVideo(video){
 }
 
 function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,storageKey}){
-  let disposed=false,failed=false,candidate=null,active=null,requestPending=false,loadingSince=0;
+  let disposed=false,candidate=null,active=null,requestPending=false,loadingSince=0,manual=null,observed=null,unwatch=null,automationDepth=0;
   const clean=value=>String(value||'').replace(/\s+/g,' ').trim();
   function visible(element){
     try{const style=element?.ownerDocument.defaultView.getComputedStyle(element);return Boolean(element&&element.isConnected!==false&&element.getClientRects().length&&style.display!=='none'&&style.visibility!=='hidden'&&style.visibility!=='collapse');}catch{return false;}
@@ -916,8 +918,10 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
     try{const current=read(snapshot.video,snapshot.popup);return current.card===snapshot.card&&current.signature===snapshot.signature&&current.q.options.every((option,index)=>option.element===snapshot.q.options[index].element);}catch{return false;}
   }
   function pause(video){try{video?.pause();}catch{}}
+  function nativeClick(element){automationDepth++;try{element.click();}finally{automationDepth--;}}
   function fail(message){
-    if(disposed||failed)return;failed=true;pause(getVideo());setStatus(message);onError(message);
+    if(disposed||manual)return;
+    waitForManual(observed||active?.snapshot,message);onError(message);
   }
   const keyFor=signature=>typeof storageKey==='function'?storageKey(signature):String(storageKey||'codexVideoPopup:')+signature;
   function readJournal(key){const value=sessionStorage.getItem(key);if(!value)return null;try{const result=JSON.parse(value);return typeof result==='object'?result:{state:String(result)};}catch{return {state:value};}}
@@ -927,30 +931,83 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
   const reviewRequired=snapshot=>['#spanNotBack','#spanNotBackPoint'].some(s=>visible(snapshot.card.querySelector(s)));
   const canCorrect=snapshot=>wrongVisible(snapshot)&&!reviewRequired(snapshot)&&visible(snapshot.card.querySelector('#videoquiz-submit'))&&!visible(snapshot.card.querySelector('#videoquiz-submitting'));
   const answerKey=letters=>[...letters].sort().join('|');
+  function waitForManual(snapshot,message='已转为人工接管，请完成当前视频弹题'){
+    if(disposed||!snapshot)return;
+    active=null;candidate=null;
+    const key=snapshot.signature?keyFor(snapshot.signature):null;
+    manual={snapshot,baseline:Number(snapshot.video.currentTime)||0,message};
+    // This is an assistant ownership marker, never a platform completion record.
+    if(key){
+      const previous=readJournal(key)||{};
+      const {state,at,...history}=previous;
+      writeJournal(key,'manual',{...history,previousState:previous.previousState||state||null,reason:message});
+    }
+    if(popupFor(snapshot.video))pause(snapshot.video);
+    setStatus(message);
+  }
+  function watch(snapshot){
+    if(observed?.card===snapshot.card&&observed?.signature===snapshot.signature){observed=snapshot;return;}
+    unwatch?.();observed=snapshot;
+    const handler=event=>{
+      if(!event.isTrusted||disposed||manual||automationDepth>0)return;
+      const target=event.target;
+      if(event.type==='change'&&snapshot.q.options.some(o=>o.element===target)||
+         event.type==='click'&&target?.closest?.('#videoquiz-submit,#videoquiz-continue,li.ans-videoquiz-opt')){
+        waitForManual(snapshot);
+      }
+    };
+    snapshot.card.addEventListener?.('change',handler,true);snapshot.card.addEventListener?.('click',handler,true);
+    unwatch=()=>{snapshot.card.removeEventListener?.('change',handler,true);snapshot.card.removeEventListener?.('click',handler,true);};
+  }
+  function observeManual(video){
+    const previous=manual.snapshot;
+    if(video!==previous.video||videoSource(video)!==previous.source){manual=null;observed=null;unwatch?.();unwatch=null;return false;}
+    const popup=popupFor(video);
+    if(popup&&previous.signature){try{if(read(video,popup).signature!==previous.signature){manual=null;observed=null;unwatch?.();unwatch=null;return false;}}catch{}}
+    if(!popupFor(video)&&!video.paused&&Number(video.currentTime)>manual.baseline+0.05){
+      manual=null;observed=null;unwatch?.();unwatch=null;loadingSince=0;
+      setStatus('已检测到人工完成视频弹题，继续播放');return false;
+    }
+    if(popupFor(video))pause(video);
+    setStatus(manual.message+' · 完成后将自动继续监测');return true;
+  }
+  function owns(attempt){
+    if(disposed||active!==attempt||!same(attempt.snapshot))return false;
+    if(answerKey(selected(attempt.snapshot))!==attempt.selection){waitForManual(attempt.snapshot);return false;}
+    return true;
+  }
   function begin(snapshot){
+    observed=snapshot;
     const key=keyFor(snapshot.signature);
     const journal=readJournal(key);
     let rejected=Array.isArray(journal?.rejected)?journal.rejected:[];
     if(reviewRequired(snapshot)){fail('平台要求回看视频，暂不重新提交');return;}
+    if(journal?.state==='manual'){waitForManual(snapshot,journal.reason||'该视频弹题已有人工接管记录，请完成当前题目');return;}
+    if(rejected.length>=3){fail('视频弹题已达到三次提交上限，请检查题目');return;}
     if(canCorrect(snapshot)){
       const previous=journal?.submitted||selected(snapshot);
       if(!previous.length){fail('平台提示回答错误，但无法确认上次选项；未重复提交');return;}
       if(!rejected.some(a=>answerKey(a)===answerKey(previous)))rejected=[...rejected,previous];
+      writeJournal(key,'rejected',{rejected,submitted:previous});
       if(rejected.length>=3){fail('视频弹题已达到三次提交上限，请检查题目');return;}
-      writeJournal(key,'rejected',{rejected});
     }else if(journal){fail('该视频弹题已有提交记录，请检查平台结果；本次不重复提交');return;}
-    const attempt={snapshot,key,rejected,phase:'answering',since:Date.now(),continued:false};active=attempt;requestPending=true;
+    const attempt={snapshot,key,rejected,phase:'answering',since:Date.now(),continued:false,selection:answerKey(selected(snapshot))};active=attempt;requestPending=true;
     setStatus(rejected.length?'平台反馈回答错误，正在重新判断并修改答案':'正在调用 Codex 回答视频内弹题');
-    Promise.resolve().then(()=>requestAnswers([{...snapshot.q,retryRejected:attempt.rejected}])).then(answers=>{
-      if(disposed||active!==attempt||!same(snapshot)){if(active===attempt)active=null;return;}
+    Promise.resolve().then(()=>{
+      if(!owns(attempt))return null;
+      return requestAnswers([{...snapshot.q,retryRejected:attempt.rejected,isCurrent:()=>owns(attempt)}]);
+    }).then(answers=>{
+      if(!owns(attempt)){if(active===attempt)active=null;return;}
+      if(reviewRequired(snapshot)){fail('平台要求回看视频，暂不重新提交');return;}
       const desired=answers?.get?.(1);
       if(!Array.isArray(desired)||!desired.length||new Set(desired).size!==desired.length||desired.some(letter=>!snapshot.q.options.some(option=>option.letter===letter))||snapshot.q.kind!=='多选题'&&desired.length!==1)throw new Error('视频弹题答案验证失败，本次未提交');
       if(attempt.rejected.some(previous=>answerKey(previous)===answerKey(desired)))throw new Error('重新判断仍返回已被平台拒绝的答案，未重复提交');
+      attempt.phase='selecting';
       for(const option of snapshot.q.options){
         if(Boolean(option.element.checked)===desired.includes(option.letter))continue;
         if(snapshot.q.kind!=='多选题'&&!desired.includes(option.letter))continue;
         if(!same(snapshot))return;
-        option.element.click();
+        nativeClick(option.element);
       }
       if(!same(snapshot)){active=null;return;}
       const actual=snapshot.q.options.filter(option=>option.element.checked).map(option=>option.letter).sort();
@@ -958,8 +1015,8 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
       const submit=snapshot.card.querySelector('#videoquiz-submit');
       if(!visible(submit))throw new Error('未找到可见的视频弹题提交按钮，本次未提交');
       attempt.submitted=[...desired].sort();writeJournal(key,'submitting',{submitted:attempt.submitted,rejected:attempt.rejected});attempt.phase='submitting';attempt.since=Date.now();attempt.baseline=Number(snapshot.video.currentTime)||0;
-      setStatus('视频内弹题已选中，等待平台确认提交');submit.click();
-    }).catch(error=>{if(!disposed&&active===attempt){if(!same(snapshot)&&attempt.phase==='answering'){active=null;return;}fail('视频内弹题需要处理：'+error.message);}}).finally(()=>{requestPending=false;});
+      setStatus('视频内弹题已选中，等待平台确认提交');nativeClick(submit);
+    }).catch(error=>{if(!disposed&&active===attempt){if(attempt.phase==='answering'&&!owns(attempt)){if(active===attempt)active=null;return;}fail('视频内弹题需要处理：'+error.message);}}).finally(()=>{requestPending=false;});
   }
   function confirmSubmission(attempt){
     const {snapshot}=attempt,video=getVideo();
@@ -974,7 +1031,7 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
         return;
       }
       const continuation=snapshot.card.querySelector('#videoquiz-continue');
-      if(!attempt.continued&&visible(continuation)&&!visible(snapshot.card.querySelector('#videoquiz-submitting'))){attempt.continued=true;continuation.click();}
+      if(!attempt.continued&&visible(continuation)&&!visible(snapshot.card.querySelector('#videoquiz-submitting'))){attempt.continued=true;nativeClick(continuation);}
     }
     if((attempt.continued||!samePopup)&&!video.paused&&Number(video.currentTime)>attempt.baseline+0.05){writeJournal(attempt.key,'complete');active=null;candidate=null;setStatus('视频内弹题已完成，视频已继续播放');return;}
     if(Date.now()-attempt.since>=60000){fail('视频弹题提交后60秒仍未确认继续播放，请检查平台结果；本次不重复提交');return;}
@@ -982,23 +1039,26 @@ function createVideoPopupQuestions({getVideo,requestAnswers,setStatus,onError,st
   }
   function tick(){
     if(disposed)return;
-    const video=getVideo();if(failed){pause(video);return;}
+    const video=getVideo();
+    if(manual&&observeManual(video))return;
     if(active?.phase==='submitting'){confirmSubmission(active);return;}
     const popup=popupFor(video);
-    if(!popup){candidate=null;loadingSince=0;if(active?.phase==='answering')active=null;return;}
+    if(!popup){candidate=null;loadingSince=0;if(active?.phase==='answering'){waitForManual(active.snapshot,'弹题已关闭，等待原生播放恢复');observeManual(video);}return;}
     pause(video);
     if(active?.phase==='answering'){
       if(!same(active.snapshot)){active=null;candidate=null;}
+      else if(!owns(active))return;
       else{if(typeof codexWaitUntil==='number'&&codexWaitUntil>Date.now())setStatus('正在等待答题服务恢复 · '+new Date(codexWaitUntil).toLocaleTimeString()+' 自动重试');else setStatus('Codex 正在回答视频内弹题 · 已等待 '+Math.floor((Date.now()-active.since)/1000)+' 秒');return;}
     }
     let snapshot;
-    try{snapshot=read(video,popup);loadingSince=0;}catch(error){if(!loadingSince)loadingSince=Date.now();if(Date.now()-loadingSince>=15000)fail(error.message+'，请检查视频弹题');else setStatus('正在等待视频弹题内容加载');return;}
+    try{snapshot=read(video,popup);loadingSince=0;}catch(error){observed={video,popup,source:videoSource(video)};if(!loadingSince)loadingSince=Date.now();if(Date.now()-loadingSince>=15000)fail(error.message+'，请检查视频弹题');else setStatus('正在等待视频弹题内容加载');return;}
+    watch(snapshot);
     if(!candidate||candidate.card!==snapshot.card||candidate.video!==video||candidate.signature!==snapshot.signature)candidate={...snapshot,hits:1};else candidate.hits++;
     if(requestPending){setStatus('正在等待上一条 Codex 请求结束，再处理当前视频弹题');return;}
     if(candidate.hits>=2){candidate=null;begin(snapshot);}else setStatus('已检测到视频内弹题，正在确认题目');
   }
-  function isBlocking(){return !disposed&&(failed||active?.phase==='submitting'||Boolean(popupFor(getVideo())));}
-  function dispose(){disposed=true;candidate=null;active=null;}
+  function isBlocking(){return !disposed&&(Boolean(manual)||active?.phase==='submitting'||Boolean(popupFor(getVideo())));}
+  function dispose(){disposed=true;candidate=null;active=null;manual=null;observed=null;unwatch?.();unwatch=null;}
   return {tick,isBlocking,dispose};
 }
 
@@ -1101,10 +1161,10 @@ async function askCodex(questions,context='章节测验') {
 setStatus('正在识别并回答 '+questions.length+' 道'+context);
 const payload = questions.map((q,i)=>({ id:i+1, type:q.kind, question:q.title, options:q.options.map(o=>({letter:o.letter,text:o.text})) }));
 const images = await renderQuizImages(questions);
-await ensureCodexReady();
+await ensureCodexReady(()=>!monitorStopped&&questions.every(q=>q.card.isConnected&&(!q.isCurrent||q.isCurrent())));
 if(monitorStopped)throw new Error('脚本已停止');
 setStatus('Codex 正在回答 '+questions.length+' 道'+context);
-const data = await requestBridgeAnswers({questions:payload,images},()=>!monitorStopped&&questions.every(q=>q.card.isConnected));
+const data = await requestBridgeAnswers({questions:payload,images},()=>!monitorStopped&&questions.every(q=>q.card.isConnected&&(!q.isCurrent||q.isCurrent())));
 if(monitorStopped) throw new Error('脚本已停止');
 return data.answers;
 }
@@ -1131,7 +1191,7 @@ return result;
 }
 
 
-return async questions=>answerWithReview(questions,{ask:qs=>askCodex(qs,'视频弹题'),validate:validateAnswers,isCurrent:()=>!monitorStopped,setStatus});
+return async questions=>answerWithReview(questions,{ask:qs=>askCodex(qs,'视频弹题'),validate:validateAnswers,isCurrent:()=>!monitorStopped&&questions.every(q=>q.card.isConnected&&(!q.isCurrent||q.isCurrent())),setStatus});
 }
 const requestVideoAnswers=createVideoAnswerTools();
 
