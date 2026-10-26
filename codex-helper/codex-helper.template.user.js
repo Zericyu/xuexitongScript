@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.4.5
+// @version      4.5.0
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -10,6 +10,7 @@
 // @match        *://*.chaoxing.com/mooc2-ans/mycourse/stu*
 // @match        *://*.chaoxing.com/visit/interaction*
 // @match        *://*.chaoxing.com/mooc2-ans/visit/interaction*
+// @match        *://*.chaoxing.com/mooc-ans/zt/portal/*
 // @run-at       document-end
 // @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
@@ -23,6 +24,134 @@
 (function xuexitongMain() {
 const PAGE = unsafeWindow;
 const window = PAGE;
+function topicReaderHash(value){let result=2166136261;for(const char of String(value))result=Math.imul(result^char.charCodeAt(0),16777619);return (result>>>0).toString(36);}
+function createTopicReader({adapter,read=()=>null,write=()=>{},now=()=>Date.now(),dwellMs=12000,stableMs=1000,loadTimeoutMs=30000,imageTimeoutMs=45000}){
+  const directory=adapter.directory(),ids=directory.map(item=>item.id),order=topicReaderHash(ids.join('|'));
+  let saved=null;try{saved=read();}catch{}
+  if(!saved||saved.version!==1||saved.order!==order||!Array.isArray(saved.doneIds)||!saved.doneIds.every((id,index)=>ids[index]===id))saved=null;
+  let done=saved?saved.doneIds.slice():[],index=done.length,offset=saved&&saved.currentId===ids[index]&&Number.isFinite(saved.offset)?Math.max(0,saved.offset):0;
+  let enabled=false,disposed=false,phase='idle',message='点击开始阅读',lastTick=null,dwell=0,foregroundMs=Number(saved?.foregroundMs)||0,screen=Number(saved?.screen)||1,layout=null,layoutFor=0,imageWait=0,pending=null,positioned=false,lastForegroundAt=null,lastAdvanceAt=null;
+  const resumeRequested=Boolean(saved?.enabled);
+  function save(){try{write({version:1,order,doneIds:done.slice(),currentId:ids[index]||null,offset,screen,foregroundMs,enabled});}catch{}}
+  function attention(reason){enabled=false;phase='needs_attention';message=reason;lastTick=null;pending=null;save();}
+  function summary(){const active=adapter.active();return {version:'4.5.0',enabled,phase,message,currentSection:index<directory.length?index+1:directory.length,currentTitle:directory[index]?.title||'目录末尾',totalSections:directory.length,browsedSections:done.length,screen,screenDwellMs:Math.floor(dwell),foregroundMs:Math.floor(foregroundMs),visible:active.visible,focused:active.focused,eligible:active.visible&&active.focused,scrollTop:Math.round(adapter.scrollTop()),viewportHeight:Math.round(adapter.viewportHeight()),lastForegroundAt,lastAdvanceAt,loading:Boolean(pending),platformCompletionVerified:false};}
+  function start(){if(disposed||phase==='complete')return false;if(!directory.length){attention('没有找到可识别的专题目录');return false;}enabled=true;phase='running';message='准备显示当前章节';lastTick=null;positioned=false;layout=null;layoutFor=0;imageWait=0;dwell=0;save();return true;}
+  function pause(){if(disposed)return;enabled=false;phase='paused';message='已暂停，可继续当前阅读位置';lastTick=null;save();}
+  function stop(){if(disposed)return;enabled=false;phase='stopped';message='已停止，阅读断点已保留';lastTick=null;pending=null;save();}
+  function visibilityChanged(){lastTick=null;if(enabled&&!disposed){const active=adapter.active();if(!active.visible||!active.focused){phase='waiting_focus';message='切回专题页面并保持聚焦后继续';}}}
+  function finish(){enabled=false;phase='complete';message='本专题目录已逐屏浏览；平台任务状态请查看原页面';lastTick=null;pending=null;save();}
+  function waitForContent(expected,delta){
+    const loaded=adapter.loadedIds();
+    if(loaded.some(id=>!ids.includes(id))){attention('发现目录之外的内容，已停止自动浏览');return false;}
+    if(!loaded.every((id,position)=>ids[position]===id)){attention('专题加载顺序与目录不一致，请检查页面');return false;}
+    if(pending){
+      if(expected&&adapter.measure(expected)){pending=null;positioned=false;layout=null;layoutFor=0;imageWait=0;return true;}
+      if(!expected&&adapter.nativeEnd()){finish();return false;}
+      if(expected&&loaded.length>pending.before.length){pending=null;return waitForContent(expected,0);}
+      pending.elapsed+=delta;phase='loading';message='正在等待原生页面加载下一节';
+      if(pending.elapsed>=loadTimeoutMs)attention('加载更多后未出现目录中的下一节，请检查页面');
+      return false;
+    }
+    if(!expected&&adapter.nativeEnd()){finish();return false;}
+    if(expected&&adapter.measure(expected))return true;
+    if(!loaded.length||expected&&loaded.includes(expected)){
+      pending={expected,elapsed:0,before:loaded.slice()};phase='loading';message='等待原生章节正文显示';return false;
+    }
+    if(adapter.loadMore()||adapter.loading()){
+      pending={expected,elapsed:0,before:loaded.slice()};phase='loading';message='已请求原生加载更多，等待内容显示';return false;
+    }
+    attention(expected?'尚未找到下一节或可用的原生加载更多按钮':'目录已浏览，原生页面末尾状态尚未确认');return false;
+  }
+  function tick(){
+    if(disposed||!enabled)return summary();
+    const instant=now(),active=adapter.active();
+    if(!active.visible||!active.focused){lastTick=null;phase='waiting_focus';message='切回专题页面并保持聚焦后继续';return summary();}
+    const delta=lastTick===null?0:Math.max(0,Math.min(1500,instant-lastTick));lastTick=instant;lastForegroundAt=instant;
+    try{
+      if(index>=directory.length){waitForContent(null,delta);return summary();}
+      const id=ids[index];if(!waitForContent(id,delta))return summary();
+      const measure=adapter.measure(id);
+      if(!measure||!Number.isFinite(measure.top)||!Number.isFinite(measure.bottom)||measure.bottom<=measure.top||measure.height<=0){attention('当前正文或滚动区域不可用，请检查页面');return summary();}
+      const maxOffset=Math.max(0,measure.bottom-measure.top-measure.height);offset=Math.min(offset,maxOffset);
+      const target=Math.max(0,Math.min(measure.top+offset,Number.isFinite(measure.maxScrollTop)?measure.maxScrollTop:Infinity));
+      if(!positioned||Math.abs(measure.scrollTop-target)>5){
+        adapter.scrollTo(target);positioned=true;layout=null;layoutFor=0;dwell=0;phase='running';message='正在显示第 '+(index+1)+' 节正文';save();return summary();
+      }
+      if(!measure.imagesReady){imageWait+=delta;dwell=0;layout=null;layoutFor=0;phase='waiting_images';message='等待当前视口图片加载';if(imageWait>=imageTimeoutMs)attention('当前视口图片未加载完成，请检查网络后继续');return summary();}
+      imageWait=0;
+      const token=[measure.top,measure.bottom,measure.height];
+      if(!layout||token.some((value,i)=>Math.abs(value-layout[i])>2)){layout=token;layoutFor=0;dwell=0;phase='stabilizing';message='等待正文布局稳定';return summary();}
+      layoutFor+=delta;if(layoutFor<stableMs){phase='stabilizing';message='等待正文布局稳定';return summary();}
+      phase='reading';message='前台浏览第 '+(index+1)+' 节 · 第 '+screen+' 屏';dwell+=delta;foregroundMs+=delta;
+      if(dwell<dwellMs){save();return summary();}
+      if(measure.scrollTop+measure.height>=measure.bottom-2){
+        done.push(id);index++;offset=0;screen=1;dwell=0;layout=null;layoutFor=0;positioned=false;lastAdvanceAt=instant;message='本节已浏览，准备显示下一节';save();return summary();
+      }
+      offset=Math.min(maxOffset,offset+Math.max(1,measure.height*0.75));screen++;dwell=0;layout=null;layoutFor=0;positioned=false;lastAdvanceAt=instant;
+      adapter.scrollTo(measure.top+offset);positioned=true;message='已滚动至下一屏，继续前台浏览';save();return summary();
+    }catch{attention('专题页面结构发生变化，请检查后继续');return summary();}
+  }
+  function dispose(){if(disposed)return;save();disposed=true;lastTick=null;pending=null;}
+  return {start,resume:start,pause,stop,tick,snapshot:summary,visibilityChanged,dispose,resumeRequested};
+}
+function createTopicDomAdapter(page){
+  const doc=page.document;
+  const visible=element=>{if(!element||element.isConnected===false||!element.getClientRects().length)return false;const style=page.getComputedStyle(element);return style.display!=='none'&&style.visibility!=='hidden'&&style.visibility!=='collapse';};
+  const scroller=()=>{const body=doc.getElementById('outerBody');return body===doc.body?body:null;};
+  const sections=()=>{const root=doc.getElementById('cardview');return root?Array.from(root.querySelectorAll('div[id^="knowledge-"]')).filter(element=>element.tagName==='DIV'&&visible(element)&&visible(element.querySelector('.ans-cc'))):[];};
+  const idFor=element=>element.id.slice('knowledge-'.length);
+  function directory(){
+    const seen=new Set(),result=[];
+    for(const link of doc.querySelectorAll('a.wh.wh1')){
+      if(!visible(link))continue;let url;try{url=new URL(link.getAttribute('href'),page.location.href);}catch{continue;}
+      if(url.origin!==page.location.origin||!/^\/mooc-ans\/ztnodedetailcontroller\/visitnodedetail\/?$/.test(url.pathname))continue;
+      const id=url.searchParams.get('knowledgeId'),title=String(link.innerText||'').replace(/\s+/g,' ').trim();
+      if(!id||!/^\d+$/.test(id)||!title||seen.has(id))continue;seen.add(id);result.push({id,title:title.slice(0,120)});
+    }
+    return result;
+  }
+  function measure(id){
+    const body=scroller(),section=sections().find(element=>idFor(element)===id),content=section?.querySelector('.ans-cc');
+    if(!body||!content)return null;
+    const bounds=content.getBoundingClientRect(),viewport=body.getBoundingClientRect(),height=body.clientHeight;
+    if(bounds.height<=0||height<=0)return null;
+    const imagesReady=Array.from(content.querySelectorAll('img')).filter(visible).filter(image=>{const r=image.getBoundingClientRect();return r.bottom>=viewport.top&&r.top<=viewport.top+height;}).every(image=>image.complete&&image.naturalWidth>0);
+    return {top:body.scrollTop+bounds.top-viewport.top,bottom:body.scrollTop+bounds.bottom-viewport.top,scrollTop:body.scrollTop,height,maxScrollTop:Math.max(0,body.scrollHeight-height),imagesReady};
+  }
+  const button=()=>doc.getElementById('loadbutton');
+  const text=()=>String(button()?.innerText||'').replace(/\s+/g,' ').trim();
+  return {directory,measure,loadedIds:()=>sections().map(idFor),active:()=>({visible:doc.visibilityState==='visible',focused:doc.hasFocus()}),scrollTop:()=>scroller()?.scrollTop||0,viewportHeight:()=>scroller()?.clientHeight||0,
+    scrollTo:top=>{const body=scroller();if(!body)throw new Error('Missing topic body');body.scrollTop=Math.max(0,Math.min(top,body.scrollHeight-body.clientHeight));},
+    loading:()=>visible(button())&&/加载中|正在加载/.test(text()),
+    loadMore:()=>{const element=button();if(!visible(element)||element.disabled||element.getAttribute('aria-disabled')==='true'||!/加载更多/.test(text()))return false;element.click();return true;},
+    nativeEnd:()=>{const element=button();return Boolean(element)&&(!visible(element)||/没有更多|已全部加载|已加载全部|没有了/.test(text()));}};
+}
+function bootTopicReader(page){
+  if(!/^\/mooc-ans\/zt\/portal\/[^/]+\/?$/.test(page.location.pathname))return false;
+  page.__codexTopicReader?.dispose?.();
+  const doc=page.document,adapter=createTopicDomAdapter(page),key='codexTopicReader:'+topicReaderHash(page.location.origin+page.location.pathname);
+  const reader=createTopicReader({adapter,read:()=>{try{return JSON.parse(page.sessionStorage.getItem(key)||'null');}catch{return null;}},write:value=>page.sessionStorage.setItem(key,JSON.stringify(value))});
+  const panel=doc.createElement('section');panel.id='codex-topic-reader';panel.style.cssText='position:fixed;right:16px;bottom:16px;width:310px;max-width:calc(100vw - 32px);padding:14px;background:white;border:1px solid #dce4ee;border-radius:14px;box-shadow:0 4px 20px #0002;z-index:2147483646;color:#24364d;font:14px/1.6 sans-serif';
+  const title=doc.createElement('strong');title.textContent='专题阅读助手';
+  const status=doc.createElement('div'),progress=doc.createElement('div'),hint=doc.createElement('small');hint.textContent='仅前台聚焦时逐屏停留；浏览不代表平台任务已完成。';
+  const controls=doc.createElement('div'),start=doc.createElement('button'),pause=doc.createElement('button'),stop=doc.createElement('button');
+  start.textContent='开始 / 继续';pause.textContent='暂停';stop.textContent='停止';
+  for(const control of [start,pause,stop])control.style.cssText='margin:8px 7px 0 0;padding:5px 10px;border:1px solid #ccd9eb;border-radius:7px;background:#fff;cursor:pointer';
+  controls.append(start,pause,stop);panel.append(title,status,progress,hint,controls);doc.body.append(panel);
+  function render(){const state=reader.snapshot();status.textContent=state.message;progress.textContent=state.currentTitle+' · 已浏览 '+state.browsedSections+' / '+state.totalSections+' 节';start.disabled=state.enabled||state.phase==='complete';pause.disabled=!state.enabled;stop.disabled=!state.enabled&&state.phase==='stopped';panel.dataset.phase=state.phase;}
+  start.onclick=()=>{reader.start();render();};pause.onclick=()=>{reader.pause();render();};stop.onclick=()=>{reader.stop();render();};
+  const changed=()=>{reader.visibilityChanged();render();};
+  doc.addEventListener('visibilitychange',changed);page.addEventListener('focus',changed);page.addEventListener('blur',changed);
+  const timer=page.setInterval(()=>{reader.tick();render();},1000);
+  let disposed=false;
+  const api={start:()=>{const result=reader.start();render();return result;},resume:()=>{const result=reader.resume();render();return result;},pause:()=>{reader.pause();render();},stop:()=>{reader.stop();render();},snapshot:reader.snapshot,
+    dispose:()=>{if(disposed)return;disposed=true;reader.dispose();page.clearInterval(timer);doc.removeEventListener('visibilitychange',changed);page.removeEventListener('focus',changed);page.removeEventListener('blur',changed);page.removeEventListener('pagehide',api.dispose);panel.remove();}};
+  page.__codexTopicReader=api;page.addEventListener('pagehide',api.dispose,{once:true});
+  if(reader.resumeRequested)reader.start();render();return true;
+}
+
+if(bootTopicReader(PAGE))return;
+
 function createCourseQueue({read,write,now=()=>Date.now(),navigate,listUrl}){
   const duration=12*60*60*1000;
   const isKey=value=>typeof value==='string'&&value.trim().length>0;
@@ -215,7 +344,7 @@ onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待�
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.4.5';
+const SCRIPT_VERSION='4.5.0';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
