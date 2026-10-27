@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通 Codex 章节练习助手
 // @namespace    local.codex.xuexitong.chapter-helper
-// @version      4.5.0
+// @version      4.5.1
 // @description  最高可用倍速、线路恢复、文档阅读与章节答题；整课完成后按列表顺序继续未完成课程
 // @author       Codex
 // @match        *://*.chaoxing.com/mycourse/studentstudy*
@@ -344,7 +344,7 @@ onerror: () => reject(new Error('无法连接本机 Codex 服务，正在等待�
 ontimeout: () => reject(new Error('Codex 调用超时，本次未提交')),
 }));
 }
-const SCRIPT_VERSION='4.5.0';
+const SCRIPT_VERSION='4.5.1';
 const courseContext=Array.from(new URL(location.href).searchParams).filter(([key])=>['courseid','clazzid'].includes(key.toLowerCase())).map(([key,value])=>key.toLowerCase()+'='+value).sort().join('&');
 const monitorStorageKey='codexIntegratedMonitor:'+courseContext;
 let sessionState;
@@ -378,10 +378,15 @@ function trackPlaybackProgress(identity,time){
 function notifyUser(message,complete=false){
   try{if(typeof GM_notification==='function')GM_notification({title:complete?'课程播放已完成':'课程播放需要处理',text:message,tag:'codex-study-'+courseContext,timeout:15000,silent:false,onclick:()=>PAGE.focus()});}catch{}
 }
+function monitorPlaybackSpeed(){
+  try{const video=engineType==='continuous'?PAGE.__codexCoursePlayback?.getVideo?.():PAGE[APP_KEY]?._getVideoEl?.();return playbackSpeed.snapshot(video?.ownerDocument);}catch{return null;}
+}
 function renderMonitor(){
   const modeText={starting:'启动中',running:'监测中',recovering:'正在恢复',complete:'已完成',needs_attention:'需要处理',stopped:'已停止'}[monitorMode]||monitorMode;
   monitorText.textContent=modeText+' · 已检查 '+checks+' 次 · 自动恢复 '+sessionState.recoveries+' 次 · 保持唤醒：'+wakeMessage;
   if(document.getElementById('coursetree'))monitorText.textContent+=' · 剩余任务：'+remainingTasks();
+  const speed=monitorPlaybackSpeed();
+  if(speed)monitorText.textContent+=' · 倍速：'+speed.actualRate+'x / 目标'+speed.targetRate+'x'+(speed.status==='restricted'?'（页面限制）':'');
   panel.dataset.mode=monitorMode;
   startButton.disabled=!monitorStopped&&monitorMode!=='starting';
   stopButton.disabled=monitorStopped;
@@ -579,7 +584,7 @@ function prepareCourseQueue(){
   sessionState.deadline=Math.min(sessionState.deadline,courseQueue.snapshot().deadline);saveSession();return true;
 }
 PAGE.__codexCourseQueue=courseQueue?{snapshot:()=>courseQueue.snapshot(),stop:()=>stopIntegrated('已停止',true),start:restartIntegrated}:null;
-PAGE.__xuexitongMonitor={version:SCRIPT_VERSION,start:restartIntegrated,stop:()=>stopIntegrated('已停止',true),dispose:disposeIntegrated,snapshot:()=>({version:SCRIPT_VERSION,engine:engineType,mode:monitorMode,running:!monitorStopped,checks,recoveries:sessionState.recoveries,deadline:sessionState.deadline,wakeLockHeld:Boolean(wakeLock&&!wakeLock.released),wakeMessage,codex:{...codexState},playback:engineSnapshot(),records:monitorRecords.slice()})};
+PAGE.__xuexitongMonitor={version:SCRIPT_VERSION,start:restartIntegrated,stop:()=>stopIntegrated('已停止',true),dispose:disposeIntegrated,snapshot:()=>({version:SCRIPT_VERSION,engine:engineType,mode:monitorMode,running:!monitorStopped,checks,recoveries:sessionState.recoveries,deadline:sessionState.deadline,wakeLockHeld:Boolean(wakeLock&&!wakeLock.released),wakeMessage,speed:monitorPlaybackSpeed(),codex:{...codexState},playback:engineSnapshot(),records:monitorRecords.slice()})};
 panel.dataset.version=SCRIPT_VERSION;
 document.addEventListener('visibilitychange',()=>{if(!monitorStopped&&document.visibilityState==='visible')acquireWakeLock();});
 PAGE.addEventListener('pagehide',()=>disposeIntegrated('页面正在切换'),{once:true});
@@ -867,31 +872,54 @@ function createPlaybackLineRecovery({storageKey,setStatus}){
 }
 
 function createPlaybackSpeedController(){
-  const attempts=new WeakMap();
+  const states=new WeakMap();
+  function sourceKey(video,doc){
+    try{
+      const data=JSON.parse(doc.defaultView?.frameElement?.getAttribute?.('data')||'{}');
+      if(data.objectid||data.objectId)return 'attachment:'+String(data.objectid||data.objectId);
+    }catch{}
+    const source=video.currentSrc||video.src||video.querySelector?.('source')?.getAttribute?.('src')||'';
+    try{return new URL(source,doc.baseURI).pathname;}catch{return String(source).split(/[?#]/)[0];}
+  }
+  function stateFor(video,doc){
+    const key=sourceKey(video,doc);let state=states.get(video);
+    if(!state||state.key!==key){state={key,targetRate:2,nativeAttempted:false,fallbackAttempted:false,requested:false,status:'waiting'};states.set(video,state);}
+    return state;
+  }
   function apply(doc){
     try{
-      const video=doc?.querySelector('video');
-      if(!video)return false;
+      const video=doc?.querySelector('video');if(!video||video.readyState===0)return false;
+      const state=stateFor(video,doc);
       const choices=Array.from(doc.querySelectorAll('.vjs-playback-rate .vjs-menu-item')).flatMap(element=>{
         const text=(element.querySelector('.vjs-menu-item-text')?.textContent||element.textContent||'').trim();
-        const match=/^(\d+(?:\.\d+)?)x/i.exec(text),rate=match?Number(match[1]):0;
+        const match=/^(\d+(?:\.\d+)?)\s*(?:x|×|倍)/i.exec(text),rate=match?Number(match[1]):0;
         return Number.isFinite(rate)&&rate>0?[{element,rate}]:[];
       });
-      const highest=choices.sort((a,b)=>b.rate-a.rate)[0];
-      if(!highest)return false;
-      const atHighest=()=>Math.abs(Number(video.playbackRate)-highest.rate)<0.001;
-      if(atHighest()){attempts.delete(video);return false;}
-      const now=Date.now(),previous=attempts.get(video);
-      if(previous!==undefined&&now-previous<5000)return false;
-      attempts.set(video,now);
-      highest.element.click();
-      if(atHighest())attempts.delete(video);
+      const highest=choices.sort((a,b)=>b.rate-a.rate)[0];if(!state.requested)state.targetRate=highest?.rate>1?highest.rate:2;
+      const atTarget=()=>Number(video.playbackRate)>=state.targetRate-0.001;
+      if(atTarget()){state.status=state.requested?'applied':'already_target';return false;}
+      // Observe platform rollbacks without repeatedly fighting the rate restriction.
+      if(state.requested){state.status='restricted';return false;}
+      if(highest?.rate>1&&!state.nativeAttempted){
+        state.nativeAttempted=true;try{highest.element.click();}catch{}
+        if(atTarget()){state.requested=true;state.status='native';return true;}
+      }
+      if(state.fallbackAttempted){state.status='restricted';return false;}
+      state.fallbackAttempted=true;state.requested=true;state.targetRate=2;
+      try{video.playbackRate=2;state.status=atTarget()?'fallback':'restricted';}catch{state.status='restricted';}
       return true;
     }catch{return false;}
   }
-  return {apply};
+  function snapshot(doc){
+    try{
+      const video=doc?.querySelector('video');if(!video)return null;
+      const state=stateFor(video,doc),actualRate=Number(video.playbackRate);
+      if(state.requested&&actualRate<state.targetRate-0.001)state.status='restricted';
+      return {targetRate:state.targetRate,actualRate,status:state.status,nativeAttempted:state.nativeAttempted,fallbackAttempted:state.fallbackAttempted};
+    }catch{return null;}
+  }
+  return {apply,snapshot};
 }
-
 const playbackSpeed=createPlaybackSpeedController();
 
 function createChapterFlowAdapter(app){
